@@ -1,0 +1,6 @@
+Package: lorawangpsfwd
+Version: 1.0
+Maintainer: Ozan Gunalp <ozan.gunalp@nicolas-bourbaki.com>
+Architecture: all
+Description: LoRaWan GPS Packet Forwarder
+

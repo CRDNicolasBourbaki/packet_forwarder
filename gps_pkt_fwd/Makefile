@@ -2,6 +2,8 @@
 
 APP_NAME := gps_pkt_fwd
 
+DEBDIR := ${DESTDIR}/deb
+
 ### Environment constants 
 
 LGW_PATH ?= ../../lora_gateway/libloragw
@@ -54,9 +56,29 @@ endif
 
 all: $(APP_NAME)
 
+install:
+	# create install dir
+	mkdir -p ${DESTDIR}/$(APP_NAME)
+	# copy exec
+	cp $(APP_NAME) ${DESTDIR}/$(APP_NAME)/$(APP_NAME)
+	# copy conf files	
+	cp ./*.json ${DESTDIR}/$(APP_NAME)/
+
+deb:
+	# create deb directory
+	echo ${DEBDIR}
+	mkdir -p ${DEBDIR}
+	# copy deb files
+	cp -r DEBIAN ${DEBDIR}
+	# create folders for deb
+	mkdir -p  ${DEBDIR}${DEBTARGETDIR}
+	cp ${DESTDIR}/$(APP_NAME)/* ${DEBDIR}${DEBTARGETDIR}
+	dpkg-deb -b -Zgzip ${DEBDIR} ${DESTDIR}
+	rm -r ${DEBDIR}
 clean:
 	rm -f obj/*.o
 	rm -f $(APP_NAME)
+	rm -f -r ${DESTDIR}/$(APP_NAME)
 
 ### Sub-modules compilation
 
