@@ -51,6 +51,12 @@ Maintainer: Sylvain Miermont
 #include "loragw_gps.h"
 #include "loragw_aux.h"
 
+
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE MACROS ------------------------------------------------------- */
 
@@ -76,6 +82,8 @@ Maintainer: Sylvain Miermont
 #define PULL_TIMEOUT_MS		200
 #define GPS_REF_MAX_AGE		30	/* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
 #define FETCH_SLEEP_MS		10	/* nb of ms waited when a fetch return no packets */
+#define DEFAULT_CERT_PATH	"certs/client-cert.pem"
+#define DEFAULT_KEY_PATH	"certs/client-key.pem"
 
 #define	PROTOCOL_VERSION	1
 
@@ -97,6 +105,12 @@ Maintainer: Sylvain Miermont
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
+
+/* ssl variables */
+SSL_CTX *ctx;
+BIO *bio;
+static char ssl_cert_path[64] = STR(DEFAULT_CERT_PATH);
+static char ssl_key_path[64] = STR(DEFAULT_KEY_PATH);
 
 /* signal handling variables */
 volatile bool exit_sig = false; /* 1 -> application terminates cleanly (shut down hardware, close open files, etc) */
@@ -124,6 +138,10 @@ static uint32_t net_mac_l; /* Least Significant Nibble, network order */
 /* network sockets */
 static int sock_up; /* socket for upstream traffic */
 static int sock_down; /* socket for downstream traffic */
+
+/* ssl socket wrappers */
+static SSL *ssl_up;
+static SSL *ssl_down;
 
 /* network protocol variables */
 static struct timeval push_timeout_half = {0, (PUSH_TIMEOUT_MS * 500)}; /* cut in half, critical for throughput */
@@ -191,6 +209,10 @@ static int parse_SX1301_configuration(const char * conf_file);
 static int parse_gateway_configuration(const char * conf_file);
 
 static double difftimespec(struct timespec end, struct timespec beginning);
+
+static void init_SSL_certificate();
+
+static SSL *establish_SSL_session(int socket, struct addrinfo *addr);
 
 /* threads */
 void thread_up(void);
@@ -582,6 +604,19 @@ static int parse_gateway_configuration(const char * conf_file) {
 		MSG("INFO: GPS serial port path is configured to \"%s\"\n", gps_tty_path);
 	}
 
+	/* SSL certificate path */
+	str = json_object_get_string(conf_obj, "ssl_cert_path");
+	if (str != NULL) {
+		strncpy(ssl_cert_path, str, sizeof ssl_cert_path);
+		MSG("INFO: SSL certificate path is configured to \"%s\"\n", ssl_cert_path);
+	}
+	/* SSL private key path */
+	str = json_object_get_string(conf_obj, "ssl_key_path");
+	if (str != NULL) {
+		strncpy(ssl_key_path, str, sizeof ssl_key_path);
+		MSG("INFO: SSL key path is configured to \"%s\"\n", ssl_key_path);
+	}
+
 	/* get reference coordinates */
 	val = json_object_get_value(conf_obj, "ref_latitude");
 	if (val != NULL) {
@@ -629,6 +664,75 @@ static double difftimespec(struct timespec end, struct timespec beginning) {
 	x += (double)(end.tv_sec - beginning.tv_sec);
 
 	return x;
+}
+
+static void init_SSL_certificate() {
+
+	MSG("SSL version: %s\n",SSLeay_version(SSLEAY_VERSION));
+
+	OpenSSL_add_ssl_algorithms();
+	SSL_load_error_strings();
+	ctx = SSL_CTX_new(DTLSv1_client_method());
+	//SSL_CTX_set_cipher_list(ctx, "PSK-AES256-CBC-SHA:AES256-SHA256");
+	MSG("ALL:!RC4:!SSLv3:@STRENGTH");
+	SSL_CTX_set_cipher_list(ctx, "ALL:!RC4:!SSLv3:@STRENGTH");
+
+	if (!SSL_CTX_use_certificate_file(ctx, ssl_cert_path, SSL_FILETYPE_PEM))
+		MSG("\nERROR: no client certificate found!");
+
+	if (!SSL_CTX_use_PrivateKey_file(ctx, ssl_key_path, SSL_FILETYPE_PEM))
+		MSG("\nERROR: no client private key found!");
+
+	if (!SSL_CTX_check_private_key(ctx))
+		MSG("\nERROR: invalid private key!");
+
+	SSL_CTX_set_verify_depth(ctx, 2);
+	SSL_CTX_set_read_ahead(ctx, 1);
+}
+
+static SSL *establish_SSL_session(int socket, struct addrinfo *addr) {
+
+	int i;
+	// TODO redefine this size;
+	char buf[STATUS_SIZE];
+	struct timeval timeout;
+	SSL *ssl = SSL_new(ctx);
+
+	/* Create BIO, connect and set to already connected */
+	bio = BIO_new_dgram(socket, BIO_CLOSE);
+	i = connect(socket, addr->ai_addr, addr->ai_addrlen);
+	if (i != 0) {
+		MSG("ERROR: [up] connect returned %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_CONNECTED, 0, addr->ai_addr);
+
+	SSL_set_bio(ssl, bio, bio);
+
+	if (SSL_connect(ssl) < 0) {
+		perror("SSL_connect");
+		MSG("%s\n", ERR_error_string(ERR_get_error(), buf));
+		exit(-1);
+	}
+
+	/* Set and activate timeouts */
+	timeout.tv_sec = 3;
+	timeout.tv_usec = 0;
+	BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
+
+
+	if (SSL_get_peer_certificate(ssl)) {
+		MSG("------------------------------------------------------------\n");
+		X509_NAME_print_ex_fp(stdout, X509_get_subject_name(SSL_get_peer_certificate(ssl)),
+							  1, XN_FLAG_MULTILINE);
+		MSG("\n\n Cipher: %s", SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+		MSG("\n------------------------------------------------------------\n\n");
+	}
+
+	fflush(stdout);
+	char test_buf[64] = "The quick brown fox jumps over the lazy dog";
+	SSL_write(ssl, test_buf, sizeof test_buf);
+	return ssl;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -749,6 +853,10 @@ int main(void)
 	net_mac_h = htonl((uint32_t)(0xFFFFFFFF & (lgwm>>32)));
 	net_mac_l = htonl((uint32_t)(0xFFFFFFFF &  lgwm  ));
 
+
+	/* init ssl */
+	init_SSL_certificate();
+
 	/* prepare hints to open network sockets */
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC; /* should handle IP v4 or v6 automatically */
@@ -779,11 +887,7 @@ int main(void)
 	}
 
 	/* connect so we can send/receive packet with the server only */
-	i = connect(sock_up, q->ai_addr, q->ai_addrlen);
-	if (i != 0) {
-		MSG("ERROR: [up] connect returned %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
+	ssl_up = establish_SSL_session(sock_up, q);
 	freeaddrinfo(result);
 
 	/* look for server address w/ downstream port */
@@ -811,11 +915,7 @@ int main(void)
 	}
 
 	/* connect so we can send/receive packet with the server only */
-	i = connect(sock_down, q->ai_addr, q->ai_addrlen);
-	if (i != 0) {
-		MSG("ERROR: [down] connect returned %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
+	ssl_down = establish_SSL_session(sock_down, q);
 	freeaddrinfo(result);
 
 	/* starting the concentrator */
@@ -1391,7 +1491,7 @@ void thread_up(void) {
 		// printf("\nJSON up: %s\n", (char *)(buff_up + 12)); /* DEBUG: display JSON payload */
 
 		/* send datagram to server */
-		send(sock_up, (void *)buff_up, buff_index, 0);
+		SSL_write(ssl_up,  (void *)buff_up, buff_index);
 		clock_gettime(CLOCK_MONOTONIC, &send_time);
 		pthread_mutex_lock(&mx_meas_up);
 		meas_up_dgram_sent += 1;
@@ -1399,7 +1499,7 @@ void thread_up(void) {
 
 		/* wait for acknowledge (in 2 times, to catch extra packets) */
 		for (i=0; i<2; ++i) {
-			j = recv(sock_up, (void *)buff_ack, sizeof buff_ack, 0);
+			j = SSL_read(ssl_up, (void *)buff_ack, sizeof buff_ack);
 			clock_gettime(CLOCK_MONOTONIC, &recv_time);
 			if (j == -1) {
 				if (errno == EAGAIN) { /* timeout */
@@ -1408,10 +1508,10 @@ void thread_up(void) {
 					break;
 				}
 			} else if ((j < 4) || (buff_ack[0] != PROTOCOL_VERSION) || (buff_ack[3] != PKT_PUSH_ACK)) {
-				//MSG("WARNING: [up] ignored invalid non-ACL packet\n");
+				MSG("WARNING: [up] ignored invalid non-ACL packet\n");
 				continue;
 			} else if ((buff_ack[1] != token_h) || (buff_ack[2] != token_l)) {
-				//MSG("WARNING: [up] ignored out-of sync ACK packet\n");
+				MSG("WARNING: [up] ignored out-of sync ACK packet\n");
 				continue;
 			} else {
 				MSG("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
@@ -1494,7 +1594,7 @@ void thread_down(void) {
 		buff_req[2] = token_l;
 
 		/* send PULL request and record time */
-		send(sock_down, (void *)buff_req, sizeof buff_req, 0);
+		SSL_write(ssl_down, (void *)buff_req, sizeof buff_req);
 		clock_gettime(CLOCK_MONOTONIC, &send_time);
 		pthread_mutex_lock(&mx_meas_dw);
 		meas_dw_pull_sent += 1;
@@ -1507,7 +1607,7 @@ void thread_down(void) {
 		while ((int)difftimespec(recv_time, send_time) < keepalive_time) {
 
 			/* try to receive a datagram */
-			msg_len = recv(sock_down, (void *)buff_down, (sizeof buff_down)-1, 0);
+			msg_len = SSL_read(ssl_down, (void *)buff_down, (sizeof buff_down)-1);
 			clock_gettime(CLOCK_MONOTONIC, &recv_time);
 
 			/* if no network message was received, got back to listening sock_down socket */

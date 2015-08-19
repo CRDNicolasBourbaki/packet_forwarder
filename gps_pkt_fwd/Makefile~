@@ -6,9 +6,7 @@ DEBDIR := ${DESTDIR}/deb
 
 ### Environment constants 
 
-OPENSSL_INC ?= /opt/toolchains/arm-2011.03-wirma2/arm-none-linux-gnueabi/include/openssl
-#OPENSSL_LIB ?= /opt/toolchains/arm-2011.03-wirma2/arm-none-linux-gnueabi/lib
-OPENSSL_LIB ?= ../../lap-openssl-lib
+OPENSSL_PATH ?= /opt/toolchains/arm-2011.03-wirma2/arm-none-linux-gnueabi/include/openssl
 LGW_PATH ?= ../../lora_gateway/libloragw
 ARCH ?=
 CROSS_COMPILE ?=
@@ -57,7 +55,7 @@ endif
 
 # link OpenSSL
 LIBS += -lcrypto -lssl
-CFLAGS += -I$(OPENSSL_INC)
+CFLAGS += $(OPENSSL_PATH)
 
 ### General build targets
 
@@ -101,6 +99,6 @@ obj/$(APP_NAME).o: src/$(APP_NAME).c $(LGW_INC) inc/parson.h inc/base64.h
 	$(CC) -c $(CFLAGS) $(VFLAG) -I$(LGW_PATH)/inc $< -o $@
 
 $(APP_NAME): obj/$(APP_NAME).o $(LGW_PATH)/libloragw.a obj/parson.o obj/base64.o
-	$(CC) -L$(LGW_PATH) -L$(OPENSSL_LIB) $< obj/parson.o obj/base64.o -o $@ $(LIBS)
+	$(CC) -L$(LGW_PATH) $< obj/parson.o obj/base64.o -o $@ $(LIBS)
 
 ### EOF
